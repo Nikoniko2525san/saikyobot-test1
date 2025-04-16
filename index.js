@@ -1,9 +1,8 @@
-const express = require('express');
-const line = require('@line/bot-sdk');
-const { Low, JSONFile } = require('lowdb');
-const { nanoid } = require('nanoid');
-const schedule = require('node-schedule');
-
+import express from 'express';  // `require` を `import` に変更
+import line from '@line/bot-sdk';  // 同様に `import` を使用
+import low from 'lowdb';  // `require` を `import` に変更
+import { FileSync } from 'lowdb/adapters';  // `require` を `import` に変更
+import schedule from 'node-schedule';  // `import` を使用
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET
