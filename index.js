@@ -167,10 +167,11 @@ function rand() {
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`LINE Bot running on ${port}`));
   // --- 13. check:ID ---
-  if (args[0] === 'check' && args[1] && isAuthorized(userId, '副管理者')) {
-    const target = getUser(args[1]);
-    return reply(replyToken, `ID: ${args[1]}\n権限: ${target.role}\nコイン: ${target.coins}`);
-  }
+if (command === 'check' && args.length === 2) {
+  const target = getUser(args[1]);
+  if (!target) return reply(replyToken, 'ユーザーが見つかりません');
+  return reply(replyToken, `ID: ${args[1]}\n権限: ${target.role}\nコイン: ${target.coins}`);
+}
 
   // --- 14. 権限者一覧 ---
   if (text === '権限者一覧' && isAuthorized(userId, '副管理者')) {
