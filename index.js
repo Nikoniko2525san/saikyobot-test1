@@ -1,7 +1,7 @@
 import express from 'express';
 import { middleware, Client } from '@line/bot-sdk';
 import { Low } from 'lowdb';
-import { JSONFile } from 'lowdb/node';
+import { JSONFile } from 'lowdb/jsonfile';
 import cron from 'node-cron';
 
 const config = {
