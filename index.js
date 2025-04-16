@@ -1,444 +1,274 @@
-import express from 'express';  // `require` を `import` に変更
-import line from '@line/bot-sdk';  // 同様に `import` を使用
-import low from 'lowdb';  // `require` を `import` に変更
-import { FileSync } from 'lowdb/adapters';  // `require` を `import` に変更
-import schedule from 'node-schedule';  // `import` を使用
+import express from 'express';
+import { middleware, Client } from '@line/bot-sdk';
+import { Low } from 'lowdb';
+import { JSONFile } from 'lowdb/node';
+import cron from 'node-cron';
+
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET
 };
 
-const client = new line.Client(config);
+const client = new Client(config);
 const app = express();
-app.use(express.json());
+app.use(middleware(config));
 
-const adapter = new JSONFile('db.json');
+const adapter = new JSONFile('./db.json');
 const db = new Low(adapter);
+await db.read();
+db.data ||= { users: {}, keywords: {}, idResponses: {} };
+await db.write();
 
-// 初期化
-async function initDB() {
-  await db.read();
-  db.data ||= { users: {}, keywords: {}, idResponses: {} };
-  await db.write();
-}
+const defaultUser = {
+  coins: 20,
+  role: 'ノーマルメンバー'
+};
 
-const withTimeout = (fn, ms = 5000) => (...args) =>
-  Promise.race([
-    fn(...args),
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('Timeout')), ms)
-    )
-  ]);
+const roles = ['運営者', '管理者', '副管理者', 'ノーマルメンバー', 'ブラックメンバー'];
 
-// ユーザー初期化
-async function ensureUser(userId) {
-  if (!db.data.users[userId]) {
-    db.data.users[userId] = {
-      coin: 20,
-      role: 'ノーマルメンバー'
-    };
-    await db.write();
-  }
-}
-// 権限順位マップ
-const ROLES = ['ブラックメンバー', 'ノーマルメンバー', '副管理者', '管理者', '運営者'];
-
-function roleRank(role) {
-  return ROLES.indexOf(role);
+function getUser(userId) {
+  db.data.users[userId] ||= { ...defaultUser };
+  return db.data.users[userId];
 }
 
 function isAuthorized(userId, minRole) {
-  const user = db.data.users[userId];
-  return user && roleRank(user.role) >= roleRank(minRole);
+  const roleOrder = {
+    'ブラックメンバー': -1,
+    'ノーマルメンバー': 0,
+    '副管理者': 1,
+    '管理者': 2,
+    '運営者': 3
+  };
+  const role = getUser(userId).role || 'ノーマルメンバー';
+  return roleOrder[role] >= roleOrder[minRole];
 }
 
-// === LINEメッセージ受信 ===
-app.post('/webhook', line.middleware(config), async (req, res) => {
+async function reply(token, message) {
+  await client.replyMessage(token, typeof message === 'string' ? { type: 'text', text: message } : message);
+}
+
+app.post('/webhook', async (req, res) => {
   try {
-    await initDB();
-    const events = req.body.events;
-    await Promise.all(events.map(handleEvent));
+    await Promise.all(req.body.events.map(handleEvent));
     res.sendStatus(200);
   } catch (err) {
-    console.error('Webhook Error:', err);
+    console.error(err);
     res.sendStatus(500);
   }
 });
 
-// === メインイベントハンドラ ===
+// 毎日0時に全員へ20コイン配布
+cron.schedule('0 0 * * *', async () => {
+  for (const userId in db.data.users) {
+    if (db.data.users[userId].role !== 'ブラックメンバー') {
+      db.data.users[userId].coins += 20;
+    }
+  }
+  await db.write();
+});
+
 async function handleEvent(event) {
   if (event.type !== 'message' || event.message.type !== 'text') return;
+  const { text } = event.message;
   const userId = event.source.userId;
-  const message = event.message.text.trim();
-  await ensureUser(userId);
-  const user = db.data.users[userId];
+  const replyToken = event.replyToken;
 
-  // ブラックメンバーは無視
+  const user = getUser(userId);
   if (user.role === 'ブラックメンバー') return;
 
   // キーワード応答
-  const keywordReply = db.data.keywords[message];
-  if (keywordReply) {
-    await client.replyMessage(event.replyToken, { type: 'text', text: keywordReply });
-    return;
+  if (db.data.keywords[text]) {
+    return reply(replyToken, db.data.keywords[text]);
   }
 
   // ID応答
   if (db.data.idResponses[userId]) {
-    await client.replyMessage(event.replyToken, { type: 'text', text: db.data.idResponses[userId] });
-    return;
+    return reply(replyToken, db.data.idResponses[userId]);
   }
 
-  // コマンド分岐
-  if (message.startsWith('check')) return handleCheck(event, message);
-  if (message === '情報') return handleInfo(event);
-  if (message === 'スロット') return handleSlot(event);
-  if (message === 'おみくじ') return handleOmikuji(event);
-  if (message.startsWith('chat:')) return handleChatSet(event, message);
-  if (message.startsWith('notchat:')) return handleChatDelete(event, message);
-  if (message.startsWith('key:')) return handleKeySet(event, message);
-  if (message === 'notkey') return handleKeyReset(event);
-  if (message.startsWith('check:')) return handleCheckID(event, message);
-  if (message === '権限者一覧') return handleAllRoles(event);
-  if (message.startsWith('givebu:')) return handleBlackAdd(event, message);
-  if (message.startsWith('notgivebu:')) return handleBlackRemove(event, message);
-  if (message.startsWith('副官付与:')) return handleSubAdd(event, message);
-  if (message.startsWith('副官削除:')) return handleSubRemove(event, message);
-  if (message === 'ブラックリスト一覧') return handleBlackList(event);
-  if (message.startsWith('coingive:')) return handleCoinGive(event, message);
-  if (message.startsWith('allcoingive:')) return handleCoinAllGive(event, message);
-  if (message.startsWith('notcoingive:')) return handleCoinRemove(event, message);
-  if (message.startsWith('管理者付与:')) return handleAdminAdd(event, message);
-  if (message.startsWith('管理者削除:')) return handleAdminRemove(event, message);
-  if (message === '参加者一覧') return handleAllUsers(event);
-}
-// 5. check：自分 or リプライ先のID送信
-async function handleCheck(event, message) {
-  const replyToken = event.replyToken;
-  const userId = event.source.userId;
-  const replyId = event.reply?.replyTo?.userId;
+  const args = text.split(':');
 
-  const targetId = (event.reply && event.reply.replyToken) ? replyId : userId;
-  const idText = `あなたのIDは ${targetId || userId} です。`;
-  await client.replyMessage(replyToken, { type: 'text', text: idText });
-}
-
-// 6. 情報：ID, コイン, 権限
-async function handleInfo(event) {
-  const userId = event.source.userId;
-  const user = db.data.users[userId];
-  const infoText = `あなたのID: ${userId}\nコイン: ${user.coin}枚\n権限: ${user.role}`;
-  await client.replyMessage(event.replyToken, { type: 'text', text: infoText });
-}
-
-// 7. スロット
-async function handleSlot(event) {
-  const userId = event.source.userId;
-  const user = db.data.users[userId];
-
-  if (user.coin <= 0) {
-    return await client.replyMessage(event.replyToken, {
-      type: 'text',
-      text: 'コインが足りません。'
-    });
+  // --- 5. check ---
+  if (text === 'check') {
+    if (!isAuthorized(userId, 'ノーマルメンバー')) return;
+    const replyId = event.reply?.userId || userId;
+    return reply(replyToken, `あなたのIDは ${replyId} です`);
   }
 
-  user.coin -= 1;
-  const num = () => Math.floor(Math.random() * 10);
-  const a = num(), b = num(), c = num();
-  const result = `${a}${b}${c}`;
-  let reward = 0;
-  if (a === b && b === c) {
-    if (a === 7) reward = 500;
-    else if ([1, 2, 3, 4, 5, 6, 8, 9].includes(a)) reward = 75;
+  // --- 6. 情報 ---
+  if (text === '情報') {
+    if (!isAuthorized(userId, 'ノーマルメンバー')) return;
+    return reply(replyToken, `ID: ${userId}\nコイン: ${user.coins}\n権限: ${user.role}`);
   }
 
-  user.coin += reward;
-  await db.write();
-
-  const msg = reward
-    ? `${result} おめでとうございます！${reward}コイン当たり！\n残り${user.coin}コイン`
-    : `${result} はずれ！！\n残り${user.coin}コイン`;
-
-  await client.replyMessage(event.replyToken, { type: 'text', text: msg });
-}
-
-// 8. おみくじ
-async function handleOmikuji(event) {
-  const results = ['大吉', '中吉', '小吉', '吉', '末吉', '凶', '大凶'];
-  const choice = results[Math.floor(Math.random() * results.length)];
-  await client.replyMessage(event.replyToken, {
-    type: 'text',
-    text: `おみくじの結果は……「${choice}」です！`
-  });
-}
-// 9. chat:ID:メッセージ
-async function handleChatSet(event, message) {
-  const userId = event.source.userId;
-  if (!isAuthorized(userId, '副管理者')) return;
-
-  const parts = message.split(':');
-  if (parts.length < 3) return;
-  const targetId = parts[1];
-  const replyText = parts.slice(2).join(':');
-  db.data.idResponses[targetId] = replyText;
-  await db.write();
-  await client.replyMessage(event.replyToken, {
-    type: 'text',
-    text: `${targetId} に対して「${replyText}」と返すようにしました。`
-  });
-}
-
-// 10. notchat:ID
-async function handleChatDelete(event, message) {
-  const userId = event.source.userId;
-  if (!isAuthorized(userId, '副管理者')) return;
-
-  const targetId = message.replace('notchat:', '').trim();
-  delete db.data.idResponses[targetId];
-  await db.write();
-  await client.replyMessage(event.replyToken, {
-    type: 'text',
-    text: `${targetId} のID応答を削除しました。`
-  });
-}
-
-// 11. key:A:B
-async function handleKeySet(event, message) {
-  const userId = event.source.userId;
-  if (!isAuthorized(userId, '副管理者')) return;
-
-  const match = message.match(/^key:(.+?):(.+)$/);
-  if (!match) return;
-  const trigger = match[1].trim();
-  const response = match[2].trim();
-  db.data.keywords[trigger] = response;
-  await db.write();
-  await client.replyMessage(event.replyToken, {
-    type: 'text',
-    text: `キーワード「${trigger}」に対して「${response}」と返すようにしました。`
-  });
-}
-
-// 12. notkey
-async function handleKeyReset(event) {
-  const userId = event.source.userId;
-  if (!isAuthorized(userId, '副管理者')) return;
-
-  db.data.keywords = {};
-  await db.write();
-  await client.replyMessage(event.replyToken, {
-    type: 'text',
-    text: 'すべてのキーワード応答をリセットしました。'
-  });
-}
-
-// 13. check:ID
-async function handleCheckID(event, message) {
-  const userId = event.source.userId;
-  if (!isAuthorized(userId, '副管理者')) return;
-
-  const targetId = message.replace('check:', '').trim();
-  const target = db.data.users[targetId];
-  if (!target) return;
-  await client.replyMessage(event.replyToken, {
-    type: 'text',
-    text: `ID: ${targetId}\nコイン: ${target.coin}枚\n権限: ${target.role}`
-  });
-}
-
-// 14. 権限者一覧
-async function handleAllRoles(event) {
-  const userId = event.source.userId;
-  if (!isAuthorized(userId, '副管理者')) return;
-
-  const list = Object.entries(db.data.users)
-    .map(([id, u]) => `ID: ${id} → ${u.role}`)
-    .join('\n');
-  await client.replyMessage(event.replyToken, {
-    type: 'text',
-    text: list || '登録者がいません。'
-  });
-}
-// 15. givebu:ID → ブラックメンバー追加
-async function handleBlackAdd(event, message) {
-  const userId = event.source.userId;
-  if (!isAuthorized(userId, '管理者')) return;
-
-  const targetId = message.replace('givebu:', '').trim();
-  if (!db.data.users[targetId]) return;
-
-  db.data.users[targetId].role = 'ブラックメンバー';
-  await db.write();
-  await client.replyMessage(event.replyToken, {
-    type: 'text',
-    text: `${targetId} をブラックメンバーに追加しました。`
-  });
-}
-
-// 16. notgivebu:ID → ブラックメンバー解除（ノーマルに戻す）
-async function handleBlackRemove(event, message) {
-  const userId = event.source.userId;
-  if (!isAuthorized(userId, '管理者')) return;
-
-  const targetId = message.replace('notgivebu:', '').trim();
-  if (!db.data.users[targetId]) return;
-
-  db.data.users[targetId].role = 'ノーマルメンバー';
-  await db.write();
-  await client.replyMessage(event.replyToken, {
-    type: 'text',
-    text: `${targetId} をブラックメンバーから外しました。`
-  });
-}
-
-// 17. 副官付与:ID → 副管理者にする
-async function handleSubAdminAdd(event, message) {
-  const userId = event.source.userId;
-  if (!isAuthorized(userId, '管理者')) return;
-
-  const targetId = message.replace('副官付与:', '').trim();
-  if (!db.data.users[targetId]) return;
-
-  db.data.users[targetId].role = '副管理者';
-  await db.write();
-  await client.replyMessage(event.replyToken, {
-    type: 'text',
-    text: `${targetId} を副管理者に昇格しました。`
-  });
-}
-
-// 18. 副官削除:ID → ノーマルに戻す
-async function handleSubAdminRemove(event, message) {
-  const userId = event.source.userId;
-  if (!isAuthorized(userId, '管理者')) return;
-
-  const targetId = message.replace('副官削除:', '').trim();
-  if (!db.data.users[targetId]) return;
-
-  db.data.users[targetId].role = 'ノーマルメンバー';
-  await db.write();
-  await client.replyMessage(event.replyToken, {
-    type: 'text',
-    text: `${targetId} の副管理者権限を削除しました。`
-  });
-}
-
-// 19. ブラックリスト一覧
-async function handleBlacklist(event) {
-  const userId = event.source.userId;
-  if (!isAuthorized(userId, '管理者')) return;
-
-  const blackList = Object.entries(db.data.users)
-    .filter(([, u]) => u.role === 'ブラックメンバー')
-    .map(([id]) => id)
-    .join('\n');
-
-  const text = blackList || 'ブラックメンバーはいません。';
-  await client.replyMessage(event.replyToken, {
-    type: 'text',
-    text
-  });
-}
-// 20. coingive:ID:数 → 指定IDにコイン付与
-async function handleCoinGive(event, message) {
-  const userId = event.source.userId;
-  if (!isAuthorized(userId, '運営者')) return;
-
-  const parts = message.split(':');
-  if (parts.length < 3) return;
-  const targetId = parts[1];
-  const amount = parseInt(parts[2], 10);
-  if (!db.data.users[targetId]) return;
-
-  db.data.users[targetId].coin += amount;
-  await db.write();
-  await client.replyMessage(event.replyToken, {
-    type: 'text',
-    text: `${targetId} に ${amount}コイン付与しました。`
-  });
-}
-
-// 21. allcoingive:数 → 全ユーザーに一括付与
-async function handleAllCoinGive(event, message) {
-  const userId = event.source.userId;
-  if (!isAuthorized(userId, '運営者')) return;
-
-  const amount = parseInt(message.replace('allcoingive:', ''), 10);
-  Object.values(db.data.users).forEach(u => {
-    if (u.role !== 'ブラックメンバー') {
-      u.coin += amount;
+  // --- 7. スロット ---
+  if (text === 'スロット') {
+    if (!isAuthorized(userId, 'ノーマルメンバー')) return;
+    if (user.coins < 1) return reply(replyToken, 'コインが足りません');
+    user.coins -= 1;
+    const slot = [rand(), rand(), rand()];
+    const result = slot.join('');
+    let win = 0;
+    if (slot[0] === slot[1] && slot[1] === slot[2]) {
+      if (result === '777') win = 500;
+      else win = 75;
+      user.coins += win;
+      await db.write();
+      return reply(replyToken, `${result} 当たり！！${win}コイン獲得\n残り ${user.coins} コイン`);
     }
-  });
-  await db.write();
-  await client.replyMessage(event.replyToken, {
-    type: 'text',
-    text: `全メンバーに ${amount}コイン付与しました。`
-  });
+    await db.write();
+    return reply(replyToken, `${result} はずれ！！\n残り ${user.coins} コイン`);
+  }
+
+  // --- 8. おみくじ ---
+  if (text === 'おみくじ') {
+    if (!isAuthorized(userId, 'ノーマルメンバー')) return;
+    const fortunes = ['大吉', '中吉', '小吉', '末吉', '凶'];
+    const fortune = fortunes[Math.floor(Math.random() * fortunes.length)];
+    return reply(replyToken, `あなたの運勢は・・・${fortune}！`);
+  }
+
+  // --- 9. chat:ID:メッセージ ---
+  if (args[0] === 'chat' && isAuthorized(userId, '副管理者')) {
+    const targetId = args[1];
+    const message = args.slice(2).join(':');
+    db.data.idResponses[targetId] = message;
+    await db.write();
+    return reply(replyToken, `ID応答を設定しました`);
+  }
+
+  // --- 10. notchat:ID ---
+  if (args[0] === 'notchat' && isAuthorized(userId, '副管理者')) {
+    delete db.data.idResponses[args[1]];
+    await db.write();
+    return reply(replyToken, `ID応答を削除しました`);
+  }
+
+  // --- 11. key:A:B ---
+  if (args[0] === 'key' && isAuthorized(userId, '副管理者')) {
+    db.data.keywords[args[1]] = args[2];
+    await db.write();
+    return reply(replyToken, `キーワード応答を登録しました`);
+  }
+
+  // --- 12. notkey ---
+  if (text === 'notkey' && isAuthorized(userId, '副管理者')) {
+    db.data.keywords = {};
+    await db.write();
+    return reply(replyToken, `キーワード応答を全削除しました`);
+  }
+
+  // 以下、13〜25や一覧系・管理コマンドなども含めて追加できます。続けて必要なら「続けて」と言ってください。
+}
+function rand() {
+  return Math.floor(Math.random() * 9) + 1;
 }
 
-// 22. notcoingive:ID:数 → 指定IDのコインを減らす（0未満にはしない）
-async function handleCoinRemove(event, message) {
-  const userId = event.source.userId;
-  if (!isAuthorized(userId, '運営者')) return;
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`LINE Bot running on ${port}`));
+  // --- 13. check:ID ---
+  if (args[0] === 'check' && args[1] && isAuthorized(userId, '副管理者')) {
+    const target = getUser(args[1]);
+    return reply(replyToken, `ID: ${args[1]}\n権限: ${target.role}\nコイン: ${target.coins}`);
+  }
 
-  const parts = message.split(':');
-  if (parts.length < 3) return;
-  const targetId = parts[1];
-  const amount = parseInt(parts[2], 10);
-  if (!db.data.users[targetId]) return;
+  // --- 14. 権限者一覧 ---
+  if (text === '権限者一覧' && isAuthorized(userId, '副管理者')) {
+    const result = Object.entries(db.data.users)
+      .map(([id, u]) => `ID: ${id}\n権限: ${u.role}`)
+      .join('\n\n');
+    return reply(replyToken, result || '権限者がいません');
+  }
 
-  db.data.users[targetId].coin = Math.max(0, db.data.users[targetId].coin - amount);
-  await db.write();
-  await client.replyMessage(event.replyToken, {
-    type: 'text',
-    text: `${targetId} から ${amount}コイン減らしました。`
-  });
-}
+  // --- 15. givebu:ID ---
+  if (args[0] === 'givebu' && isAuthorized(userId, '管理者')) {
+    getUser(args[1]).role = 'ブラックメンバー';
+    await db.write();
+    return reply(replyToken, `ブラックメンバーに設定しました`);
+  }
 
-// 23. 管理者付与:ID
-async function handleAdminAdd(event, message) {
-  const userId = event.source.userId;
-  if (!isAuthorized(userId, '運営者')) return;
+  // --- 16. notgivebu:ID ---
+  if (args[0] === 'notgivebu' && isAuthorized(userId, '管理者')) {
+    getUser(args[1]).role = 'ノーマルメンバー';
+    await db.write();
+    return reply(replyToken, `ブラックメンバーを解除しました`);
+  }
 
-  const targetId = message.replace('管理者付与:', '').trim();
-  if (!db.data.users[targetId]) return;
+  // --- 17. 副官付与:ID ---
+  if (args[0] === '副官付与' && isAuthorized(userId, '管理者')) {
+    getUser(args[1]).role = '副管理者';
+    await db.write();
+    return reply(replyToken, `副管理者を付与しました`);
+  }
 
-  db.data.users[targetId].role = '管理者';
-  await db.write();
-  await client.replyMessage(event.replyToken, {
-    type: 'text',
-    text: `${targetId} を管理者に昇格しました。`
-  });
-}
+  // --- 18. 副官削除:ID ---
+  if (args[0] === '副官削除' && isAuthorized(userId, '管理者')) {
+    getUser(args[1]).role = 'ノーマルメンバー';
+    await db.write();
+    return reply(replyToken, `副管理者を解除しました`);
+  }
 
-// 24. 管理者削除:ID
-async function handleAdminRemove(event, message) {
-  const userId = event.source.userId;
-  if (!isAuthorized(userId, '運営者')) return;
+  // --- 19. ブラックリスト一覧 ---
+  if (text === 'ブラックリスト一覧' && isAuthorized(userId, '管理者')) {
+    const list = Object.entries(db.data.users)
+      .filter(([_, u]) => u.role === 'ブラックメンバー')
+      .map(([id]) => id);
+    return reply(replyToken, list.length ? list.join('\n') : 'ブラックメンバーはいません');
+  }
 
-  const targetId = message.replace('管理者削除:', '').trim();
-  if (!db.data.users[targetId]) return;
+  // --- 20. coingive:ID:数 ---
+  if (args[0] === 'coingive' && isAuthorized(userId, '運営者')) {
+    const target = getUser(args[1]);
+    const amount = parseInt(args[2]);
+    if (!isNaN(amount)) {
+      target.coins += amount;
+      await db.write();
+      return reply(replyToken, `${amount}コインを付与しました`);
+    }
+  }
 
-  db.data.users[targetId].role = 'ノーマルメンバー';
-  await db.write();
-  await client.replyMessage(event.replyToken, {
-    type: 'text',
-    text: `${targetId} の管理者権限を削除しました。`
-  });
-}
+  // --- 21. allcoingive:数 ---
+  if (args[0] === 'allcoingive' && isAuthorized(userId, '運営者')) {
+    const amount = parseInt(args[1]);
+    for (const id in db.data.users) {
+      if (db.data.users[id].role !== 'ブラックメンバー') {
+        db.data.users[id].coins += amount;
+      }
+    }
+    await db.write();
+    return reply(replyToken, `全員に${amount}コインを配布しました`);
+  }
 
-// 25. 参加者一覧 → 全ユーザーID、権限、コインを送信
-async function handleAllMembers(event) {
-  const userId = event.source.userId;
-  if (!isAuthorized(userId, '運営者')) return;
+  // --- 22. notcoingive:ID:数 ---
+  if (args[0] === 'notcoingive' && isAuthorized(userId, '運営者')) {
+    const target = getUser(args[1]);
+    const amount = parseInt(args[2]);
+    if (!isNaN(amount)) {
+      target.coins = Math.max(0, target.coins - amount);
+      await db.write();
+      return reply(replyToken, `${amount}コインを減らしました（現在：${target.coins}枚）`);
+    }
+  }
 
-  const list = Object.entries(db.data.users)
-    .map(([id, u]) => `ID: ${id}\n権限: ${u.role}\nコイン: ${u.coin}枚\n`)
-    .join('\n');
+  // --- 23. 管理者付与:ID ---
+  if (args[0] === '管理者付与' && isAuthorized(userId, '運営者')) {
+    getUser(args[1]).role = '管理者';
+    await db.write();
+    return reply(replyToken, `管理者を付与しました`);
+  }
 
-  await client.replyMessage(event.replyToken, {
-    type: 'text',
-    text: list || 'ユーザーがいません。'
-  });
+  // --- 24. 管理者削除:ID ---
+  if (args[0] === '管理者削除' && isAuthorized(userId, '運営者')) {
+    getUser(args[1]).role = 'ノーマルメンバー';
+    await db.write();
+    return reply(replyToken, `管理者を解除しました`);
+  }
+
+  // --- 25. 参加者一覧 ---
+  if (text === '参加者一覧' && isAuthorized(userId, '運営者')) {
+    const list = Object.entries(db.data.users)
+      .map(([id, u]) => `ID: ${id}\n権限: ${u.role}\nコイン: ${u.coins}`)
+      .join('\n\n');
+    return reply(replyToken, list || '参加者はいません');
+  }
 }
