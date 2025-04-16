@@ -1,18 +1,10 @@
 {
-  "name": "line-bot-advanced",
+  "name": "line-bot",
   "version": "1.0.0",
-  "description": "25機能搭載のLINE BOT",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
+  "type": "module",  // この行を追加
   "dependencies": {
-    "@line/bot-sdk": "^7.5.1",
-    "express": "^4.18.2",
+    "@line/bot-sdk": "^7.0.0",
     "lowdb": "^3.0.0",
-    "node-schedule": "^2.1.1"
-  },
-  "engines": {
-    "node": ">=16.0.0"
+    "node-schedule": "^2.1.0"
   }
 }
