@@ -11,6 +11,11 @@ const config = {
 
 const client = new Client(config);
 const app = express();
+
+// JSONリクエストを解析するために必要
+app.use(express.json());
+
+// LINEのWebhookミドルウェアを使う
 app.use(middleware(config));
 
 const adapter = new JSONFile('./db.json');
