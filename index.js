@@ -1,14 +1,15 @@
 import express from 'express';
 import { middleware, Client } from '@line/bot-sdk';
+
 import { Low } from 'lowdb';
-import { JSONFile } from 'lowdb/jsonfile';
+import { JSONFile } from 'lowdb/node'; // ← 修正ポイント！
+
 import cron from 'node-cron';
 
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET
 };
-
 const client = new Client(config);
 const app = express();
 
