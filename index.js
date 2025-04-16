@@ -244,5 +244,16 @@ async function handleEvent(event) {
   }
 }
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`LINE Bot running on ${port}`));
+
+// イベントを受け取る部分（実際にはWebhookで呼ばれます）
+export async function lineWebhook(req, res) {
+  const events = req.body.events;
+  for (const event of events) {
+    try {
+      await handleEvent(event);
+    } catch (err) {
+      console.error('Error handling event:', err);
+    }
+  }
+  res.status(200).send('OK');
+}
